@@ -48,13 +48,13 @@ dim_controllerParameters = 3;  % dimension of controller parameters
 %% Video simulation
 param1.generateVideo = true;
 if param1.generateVideo
-    video_obj = VideoWriter('Results\DriveTrain.mp4','MPEG-4');
+    video_obj = VideoWriter('Results\DiffTune+P-PI.mp4','MPEG-4');
     video_obj.FrameRate = 15;
     open(video_obj);
 end
 
 %% Define simulation parameters (e.g., sample time dt, duration, etc)
-dt = 0.001;     % 1 kHz
+dt = 0.0001;     % 1 kHz
 time = 0:dt:10; % 10 s
 
 %% constant parameters
@@ -77,9 +77,9 @@ param = [N J_m J_l K_S D_S T_Cm T_Cl beta_m beta_l];
 
 
 %% Initialize controller gains (must be a vector of size dim_controllerParameters x 1)
-k_pos = 10; 
+k_pos = 1; 
 k_vel = 1;
-k_i = 10;
+k_i = 1;
 k_vec = [k_pos; k_vel; k_i];
 
 
@@ -90,7 +90,9 @@ theta_r_dot = freq * cos(freq * time);
 theta_r_2dot = - freq^2 * sin(freq * time);
 
 %% Initialize variables for DiffTune iterations
-learningRate = 1.5;  % Calculate       0.5 kunne ikke finde bedre løsning, 0.05 så rammer den k_vec = 0.1 for alle
+learningRate = 2; 
+lambda = 1;
+alpha_star = 1;
 maxIterations = 50;
 itr = 0;
 
@@ -105,9 +107,6 @@ while (1)
     itr = itr + 1;
     fprintf('------------------------\n');
     fprintf('itr = %d \n', itr);
-if (itr == 22)
-    disp("hej");
-end
     fprintf('k_vec = \n');
     disp(k_vec);
 
@@ -119,13 +118,13 @@ end
     dx_dtheta = zeros(dim_state,dim_controllerParameters);
     du_dtheta = zeros(dim_control,dim_controllerParameters);
 
+    % Storage for sensitivity norms
+    dx_dtheta_norm_sum = 0;
+    du_dtheta_norm_sum = 0;
+
     % Initialize loss and gradient of loss
     loss = 0;
     theta_gradient = zeros(1,dim_controllerParameters);
-    
-    % if (itr == 14)
-    %     disp("hej");
-    % end
 
     for k = 1 : length(time) - 1
        
@@ -139,29 +138,25 @@ end
         % Compute the sensitivity 
         [dx_dtheta, du_dtheta] = sensitivityComputation(dx_dtheta, X, Xref, theta_r_dot(k), theta_r_2dot(k), v, u, param, k_vec, dt);
 
-        % Accumulate the loss
-        % (loss is the squared norm of the position tracking error (error_theta = theta_r - theta_l))
-        loss = loss + norm(Xref - X(4))^2;
+        % Loss w/respect to state X
+        dloss_dx = 2 * [0 0 0 Xref-X(4)];
+
+        % Loss w/respect to control input u
+        dloss_du = 2 * 0;
+ 
+         % Accumulate the loss (mean-squared-error (MSE))
+        loss = loss + (norm(Xref-X(4)))^2;
          
         % Accumulating the gradient of loss w/ respect to controller parameters
-        theta_gradient = theta_gradient + 2 * [0 0 0 X(4)-Xref] * dx_dtheta;
+        theta_gradient = theta_gradient + dloss_dx * dx_dtheta + dloss_du * du_dtheta;
+
+        % Accumulate the norms for alpha_star calculation
+        dx_dtheta_norm_sum = dx_dtheta_norm_sum + norm(dx_dtheta * theta_gradient', 2)^2;
+        du_dtheta_norm_sum = du_dtheta_norm_sum + norm(du_dtheta * theta_gradient', 2)^2;
 
         % Integrate the ode dynamics
         [~,sold] = ode45(@(t,X)dynamics(t, X, u, param'),[time(k) time(k+1)], X);
         X_storage = [X_storage sold(end,:)'];   % store the new state
-
-
-       %  if (k >= 155)
-       %      disp(k);
-       %      disp(theta_gradient);
-       %  end
-       %  if isnan(theta_gradient) | (theta_gradient == - inf)
-       %     disp('k =');
-       %     disp(k);
-       %     fprintf('theta_gradient is NAN. Quit.\n');
-       %     break;
-       % end
-
         
     end
    % Compute the RMSE (root-mean-square error)
@@ -171,8 +166,20 @@ end
     loss_hist = [loss_hist loss];
     rmse_hist = [rmse_hist RMSE];
 
+    % Numerator for alpha_star
+    num = 0.5 * (theta_gradient)*theta_gradient';
+
+    % Denominator for alpha star
+    den = dx_dtheta_norm_sum + lambda * du_dtheta_norm_sum;
+
+    % Alpha star
+    alpha_star = (num/den);
+
+    % Learning rate update
+    learningRate = learningRate + alpha_star;
+
     % Update the gradient
-    gradientUpdate = - learningRate * theta_gradient;
+    gradientUpdate = -learningRate * theta_gradient;
 
     % Sanity check
     if isnan(gradientUpdate)
@@ -181,7 +188,10 @@ end
     end
 
     % Gradient descent
-    k_vec = k_vec + gradientUpdate';    % ' used for transposing matrix or vector
+    k_vec = k_vec - gradientUpdate';    % ' used for transposing matrix or vector
+    if (k_vec(2) > 1 || k_vec(2) < 0)
+        k_vec(2) = 1;
+    end
 
     fprintf('after: \n');
     fprintf('k_pos = %.4f, grad = %.4f \n', k_vec(1), theta_gradient(1));  % OBS gradienten der printes er gradienten udregnet for den tidligere k_vec værdi
@@ -191,13 +201,13 @@ end
 
     % projection of all parameters to be > 0.5
     % if k_vec(1) < 0.5
-
-    if any(k_vec < 0.5)
-        neg_indicator = (k_vec < 0.5);  % produces 3x1 array with 1 if smaller and 0 if not
-        pos_indicator = ~neg_indicator;
-        k_default = 0.5*ones(dim_controllerParameters,1);
-        k_vec = neg_indicator.*k_default + pos_indicator.*k_vec;
-    end
+    % 
+    % if any(k_vec < 1)
+    %     neg_indicator = (k_vec < 1);  % produces 3x1 array with 1 if smaller and 0 if not
+    %     pos_indicator = ~neg_indicator;
+    %     k_default = 1*ones(dim_controllerParameters,1);
+    %     k_vec = neg_indicator.*k_default + pos_indicator.*k_vec;
+    % end
 
     % store the parameters
     param_hist = [param_hist k_vec];
